@@ -1,0 +1,5 @@
+[allowlist]
+description = "Allow example/placeholder secrets in spec documentation"
+paths = [
+  "docs/superpowers/specs/.*",
+]
