@@ -6,11 +6,25 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"strconv"
+	"syscall"
 
 	"github.com/deepanshutr/bulb-cli/pkg/multiplex"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
+
+// stickyDeadlineSecs is how long the auto-armed bulb-sticky watcher keeps
+// retrying after every mutating tool call. Override with BULB_STICKY_S=0 to
+// disable, or any positive integer (seconds) to change. Default 900s = 15 min,
+// per the operator's "bake in retry for at least 15 min" requirement.
+const stickyDeadlineDefault = 900
+
+// stickyBinPath is the watcher binary; overridable for tests.
+var stickyBinPath = "bulb-sticky"
 
 // targetDesc documents the shared `target` argument across control tools.
 const targetDesc = "Bulb selector: a MAC (with or without colons), an IPv4, a " +
@@ -49,21 +63,27 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_on",
-		mcp.WithDescription("Turn a bulb, group, or 'all' on."),
+		mcp.WithDescription("Turn a bulb, group, or 'all' on. Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
-		return opResult(m.Op(ctx, pick(req), multiplex.OpOn()))
+		target := pick(req)
+		out, err := opResult(m.Op(ctx, target, multiplex.OpOn()))
+		armSticky([]string{"on"}, target)
+		return out, err
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_off",
-		mcp.WithDescription("Turn a bulb, group, or 'all' off."),
+		mcp.WithDescription("Turn a bulb, group, or 'all' off. Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
-		return opResult(m.Op(ctx, pick(req), multiplex.OpOff()))
+		target := pick(req)
+		out, err := opResult(m.Op(ctx, target, multiplex.OpOff()))
+		armSticky([]string{"off"}, target)
+		return out, err
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_brightness",
-		mcp.WithDescription("Set brightness, integer 10-100, on a bulb/group/'all'."),
+		mcp.WithDescription("Set brightness, integer 10-100, on a bulb/group/'all'. Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 		mcp.WithNumber("level", mcp.Required(), mcp.Description("Brightness 10..100")),
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
@@ -71,11 +91,14 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		if err != nil {
 			return "", err
 		}
-		return opResult(m.Op(ctx, pick(req), multiplex.OpBrightness(level)))
+		target := pick(req)
+		out, opErr := opResult(m.Op(ctx, target, multiplex.OpBrightness(level)))
+		armSticky([]string{"bri", strconv.Itoa(level)}, target)
+		return out, opErr
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_temp",
-		mcp.WithDescription("Set color temperature in Kelvin, 2200-6500, on a bulb/group/'all'."),
+		mcp.WithDescription("Set color temperature in Kelvin, 2200-6500, on a bulb/group/'all'. Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 		mcp.WithNumber("kelvin", mcp.Required(), mcp.Description("Color temp 2200..6500 K")),
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
@@ -83,11 +106,14 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		if err != nil {
 			return "", err
 		}
-		return opResult(m.Op(ctx, pick(req), multiplex.OpTemp(k)))
+		target := pick(req)
+		out, opErr := opResult(m.Op(ctx, target, multiplex.OpTemp(k)))
+		armSticky([]string{"temp", strconv.Itoa(k)}, target)
+		return out, opErr
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_color",
-		mcp.WithDescription("Set RGB color (each 0-255) on a bulb/group/'all'."),
+		mcp.WithDescription("Set RGB color (each 0-255) on a bulb/group/'all'. Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 		mcp.WithNumber("r", mcp.Required(), mcp.Description("Red 0..255")),
 		mcp.WithNumber("g", mcp.Required(), mcp.Description("Green 0..255")),
@@ -105,12 +131,16 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		if err != nil {
 			return "", err
 		}
-		return opResult(m.Op(ctx, pick(req), multiplex.OpColor(r, g, b)))
+		target := pick(req)
+		out, opErr := opResult(m.Op(ctx, target, multiplex.OpColor(r, g, b)))
+		armSticky([]string{"color", strconv.Itoa(r), strconv.Itoa(g), strconv.Itoa(b)}, target)
+		return out, opErr
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_scene",
 		mcp.WithDescription("Activate a built-in scene by name or id on a bulb/group/'all'. "+
-			"Scene sets differ per protocol; use bulb_list / the daemon /scenes catalog."),
+			"Scene sets differ per protocol; use bulb_list / the daemon /scenes catalog. "+
+			"Arms a sticky watcher to retry failed bulbs."),
 		mcp.WithString("target", mcp.Description(targetDesc)),
 		mcp.WithString("scene", mcp.Required(), mcp.Description("Scene name or id")),
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
@@ -118,7 +148,10 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		if err != nil {
 			return "", err
 		}
-		return opResult(m.Op(ctx, pick(req), multiplex.OpScene(scene)))
+		target := pick(req)
+		out, opErr := opResult(m.Op(ctx, target, multiplex.OpScene(scene)))
+		armSticky([]string{"scene", scene}, target)
+		return out, opErr
 	}))
 
 	s.AddTool(mcp.NewTool("bulb_discover",
@@ -139,6 +172,49 @@ func pick(req mcp.CallToolRequest) string {
 		return "_default"
 	}
 	return t
+}
+
+// stickyDeadline reads BULB_STICKY_S; 0 disables; unset/invalid → default 900s.
+func stickyDeadline() int {
+	v := os.Getenv("BULB_STICKY_S")
+	if v == "" {
+		return stickyDeadlineDefault
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return stickyDeadlineDefault
+	}
+	return n
+}
+
+// armSticky fork-execs `bulb-sticky <deadline_s> <cliArgs...>` detached so it
+// survives the MCP request. The watcher script is single-instance via PID file
+// — relaunching it replaces any prior sticky state automatically. Failures
+// (binary missing, exec error) are logged and swallowed; the immediate op
+// result the caller saw is the source of truth.
+//
+// target == "_default" means "no explicit target, use the daemon default" — we
+// omit it from the CLI args so the bulb CLI also picks its default.
+func armSticky(cliArgs []string, target string) {
+	if stickyDeadline() == 0 {
+		return
+	}
+	args := []string{strconv.Itoa(stickyDeadline())}
+	args = append(args, cliArgs...)
+	if target != "" && target != "_default" {
+		args = append(args, target)
+	}
+	cmd := exec.Command(stickyBinPath, args...)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		log.Printf("[bulb-mcp] sticky arm failed (%v); immediate op stands", err)
+		return
+	}
+	// Reap the watcher PID asynchronously so it doesn't become a zombie.
+	go func() { _ = cmd.Wait() }()
 }
 
 // jsonString marshals v to an indented JSON string.

@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/deepanshutr/bulb-cli/pkg/multiplex"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -40,6 +43,7 @@ func TestRegister_NineAtomicTools(t *testing.T) {
 }
 
 func TestTool_On_CallsMultiplexer(t *testing.T) {
+	t.Setenv("BULB_STICKY_S", "0") // never fork a real bulb-sticky watcher from tests
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/bulbs" && r.Method == "GET" {
@@ -57,6 +61,60 @@ func TestTool_On_CallsMultiplexer(t *testing.T) {
 	}
 	if path != "/bulb/d8a0118dc5c3/on" {
 		t.Fatalf("on path: %s", path)
+	}
+}
+
+// TestArmSticky_ForksWatcherWithExpectedArgs verifies the auto-armed sticky
+// watcher is fork-exec'd with the right deadline + CLI args after a mutating
+// tool runs. It points stickyBinPath at a tiny stub that records its argv to a
+// file the test reads back.
+func TestArmSticky_ForksWatcherWithExpectedArgs(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	stub := filepath.Join(dir, "sticky-stub.sh")
+	const stubScript = "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n"
+	if err := os.WriteFile(stub, []byte(stubScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGS_FILE", argsFile)
+
+	prevBin := stickyBinPath
+	stickyBinPath = stub
+	t.Cleanup(func() { stickyBinPath = prevBin })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bulbs" && r.Method == "GET" {
+			_, _ = w.Write([]byte(`{"bulbs":[{"mac":"d8a0118dc5c3"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	m := multiplex.New(multiplex.DaemonURLs{"wiz": srv.URL})
+
+	res := callTool(t, m, "bulb_color", map[string]any{
+		"target": "d8a0118dc5c3", "r": 255, "g": 0, "b": 0,
+	})
+	if res.IsError {
+		t.Fatalf("bulb_color tool error: %v", res.Content)
+	}
+
+	// Poll briefly — the stub writes the file from its own subprocess.
+	deadline := time.Now().Add(2 * time.Second)
+	var got string
+	for {
+		if b, err := os.ReadFile(argsFile); err == nil && len(b) > 0 {
+			got = string(b)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sticky stub never wrote args to %s", argsFile)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	want := "900\ncolor\n255\n0\n0\nd8a0118dc5c3\n"
+	if got != want {
+		t.Fatalf("sticky args:\ngot:  %q\nwant: %q", got, want)
 	}
 }
 
