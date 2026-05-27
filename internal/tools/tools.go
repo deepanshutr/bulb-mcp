@@ -9,7 +9,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/deepanshutr/bulb-cli/pkg/multiplex"
@@ -17,14 +19,30 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// stickyDeadlineSecs is how long the auto-armed bulb-sticky watcher keeps
+// stickyDeadlineDefault is how long the auto-armed bulb-sticky watcher keeps
 // retrying after every mutating tool call. Override with BULB_STICKY_S=0 to
 // disable, or any positive integer (seconds) to change. Default 900s = 15 min,
 // per the operator's "bake in retry for at least 15 min" requirement.
 const stickyDeadlineDefault = 900
 
-// stickyBinPath is the watcher binary; overridable for tests.
-var stickyBinPath = "bulb-sticky"
+// stickyBin is the resolved absolute path to bulb-sticky. Empty disables
+// sticky arming (graceful degradation if the binary is not on PATH at
+// process startup). Pinned at init so a later $PATH change cannot redirect
+// the fork-exec to an attacker-controlled binary. Tests override directly.
+var stickyBin = func() string {
+	if p, err := exec.LookPath("bulb-sticky"); err == nil {
+		return p
+	}
+	return ""
+}()
+
+// safeStickyArg matches user-influenced values that are safe to pass as
+// positional argv to the bulb CLI. The character set is the union of all
+// legitimate target/scene forms (MAC, IPv4, friendly names, group tokens
+// like zone:upstairs); the first-char anchor forbids a leading '-' or '+',
+// which is the only ASCII surface that pflag would treat as a flag prefix.
+// Belt-and-braces alongside the explicit `--` sentinel placed by armSticky.
+var safeStickyArg = regexp.MustCompile(`^[A-Za-z0-9_.:][A-Za-z0-9_.:-]*$`)
 
 // targetDesc documents the shared `target` argument across control tools.
 const targetDesc = "Bulb selector: a MAC (with or without colons), an IPv4, a " +
@@ -68,7 +86,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
 		target := pick(req)
 		out, err := opResult(m.Op(ctx, target, multiplex.OpOn()))
-		armSticky([]string{"on"}, target)
+		armSticky("on", nil, target)
 		return out, err
 	}))
 
@@ -78,7 +96,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 	), wrap(func(ctx context.Context, req mcp.CallToolRequest) (string, error) {
 		target := pick(req)
 		out, err := opResult(m.Op(ctx, target, multiplex.OpOff()))
-		armSticky([]string{"off"}, target)
+		armSticky("off", nil, target)
 		return out, err
 	}))
 
@@ -93,7 +111,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		}
 		target := pick(req)
 		out, opErr := opResult(m.Op(ctx, target, multiplex.OpBrightness(level)))
-		armSticky([]string{"bri", strconv.Itoa(level)}, target)
+		armSticky("bri", []string{strconv.Itoa(level)}, target)
 		return out, opErr
 	}))
 
@@ -108,7 +126,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		}
 		target := pick(req)
 		out, opErr := opResult(m.Op(ctx, target, multiplex.OpTemp(k)))
-		armSticky([]string{"temp", strconv.Itoa(k)}, target)
+		armSticky("temp", []string{strconv.Itoa(k)}, target)
 		return out, opErr
 	}))
 
@@ -133,7 +151,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		}
 		target := pick(req)
 		out, opErr := opResult(m.Op(ctx, target, multiplex.OpColor(r, g, b)))
-		armSticky([]string{"color", strconv.Itoa(r), strconv.Itoa(g), strconv.Itoa(b)}, target)
+		armSticky("color", []string{strconv.Itoa(r), strconv.Itoa(g), strconv.Itoa(b)}, target)
 		return out, opErr
 	}))
 
@@ -150,7 +168,7 @@ func registerAtomic(s *server.MCPServer, m *multiplex.Multiplexer) {
 		}
 		target := pick(req)
 		out, opErr := opResult(m.Op(ctx, target, multiplex.OpScene(scene)))
-		armSticky([]string{"scene", scene}, target)
+		armSticky("scene", []string{scene}, target)
 		return out, opErr
 	}))
 
@@ -187,24 +205,45 @@ func stickyDeadline() int {
 	return n
 }
 
-// armSticky fork-execs `bulb-sticky <deadline_s> <cliArgs...>` detached so it
-// survives the MCP request. The watcher script is single-instance via PID file
-// — relaunching it replaces any prior sticky state automatically. Failures
-// (binary missing, exec error) are logged and swallowed; the immediate op
-// result the caller saw is the source of truth.
+// armSticky fork-execs the bulb-sticky watcher detached so it survives the
+// MCP request. The watcher script is single-instance via PID file —
+// relaunching it replaces any prior sticky state automatically.
 //
-// target == "_default" means "no explicit target, use the daemon default" — we
-// omit it from the CLI args so the bulb CLI also picks its default.
-func armSticky(cliArgs []string, target string) {
-	if stickyDeadline() == 0 {
+// Argv layout: <deadline_s> <subcmd> -- <subcmdArgs...> [target]
+//
+// `subcmd` is a literal from registerAtomic's switch (on/off/bri/temp/color/
+// scene) and is trusted. Everything after the `--` is user-influenced — the
+// sentinel tells the downstream bulb CLI's pflag parser to stop interpreting
+// `-`-prefixed tokens as flags, defusing argv flag-smuggling. As a second
+// layer, every user-influenced argv element is validated against
+// safeStickyArg (with signed integers explicitly allowed); if any fails,
+// arming is silently skipped — the immediate op already ran successfully
+// and is the source of truth.
+//
+// Failures (binary missing, exec error) are logged and swallowed.
+//
+// target == "_default" means "no explicit target, use the daemon default"
+// — we omit it from the CLI args so the bulb CLI also picks its default.
+func armSticky(subcmd string, subcmdArgs []string, target string) {
+	if stickyDeadline() == 0 || stickyBin == "" {
 		return
 	}
-	args := []string{strconv.Itoa(stickyDeadline())}
-	args = append(args, cliArgs...)
+	for _, a := range subcmdArgs {
+		if !isSafeStickyArg(a) {
+			log.Printf("[bulb-mcp] sticky arm skipped (unsafe arg %q)", a)
+			return
+		}
+	}
+	if target != "" && target != "_default" && !isSafeStickyArg(target) {
+		log.Printf("[bulb-mcp] sticky arm skipped (unsafe target %q)", target)
+		return
+	}
+	args := []string{strconv.Itoa(stickyDeadline()), subcmd, "--"}
+	args = append(args, subcmdArgs...)
 	if target != "" && target != "_default" {
 		args = append(args, target)
 	}
-	cmd := exec.Command(stickyBinPath, args...)
+	cmd := exec.Command(stickyBin, args...)
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
@@ -215,6 +254,16 @@ func armSticky(cliArgs []string, target string) {
 	}
 	// Reap the watcher PID asynchronously so it doesn't become a zombie.
 	go func() { _ = cmd.Wait() }()
+}
+
+// isSafeStickyArg reports whether s is safe to forward as positional argv.
+// Signed integers are accepted explicitly (the `--` sentinel insulates them
+// from pflag); other values must match safeStickyArg.
+func isSafeStickyArg(s string) bool {
+	if _, err := strconv.Atoi(s); err == nil {
+		return true
+	}
+	return safeStickyArg.MatchString(s) && !strings.HasPrefix(s, "-")
 }
 
 // jsonString marshals v to an indented JSON string.

@@ -78,9 +78,9 @@ func TestArmSticky_ForksWatcherWithExpectedArgs(t *testing.T) {
 	}
 	t.Setenv("ARGS_FILE", argsFile)
 
-	prevBin := stickyBinPath
-	stickyBinPath = stub
-	t.Cleanup(func() { stickyBinPath = prevBin })
+	prevBin := stickyBin
+	stickyBin = stub
+	t.Cleanup(func() { stickyBin = prevBin })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/bulbs" && r.Method == "GET" {
@@ -112,9 +112,48 @@ func TestArmSticky_ForksWatcherWithExpectedArgs(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	want := "900\ncolor\n255\n0\n0\nd8a0118dc5c3\n"
+	want := "900\ncolor\n--\n255\n0\n0\nd8a0118dc5c3\n"
 	if got != want {
 		t.Fatalf("sticky args:\ngot:  %q\nwant: %q", got, want)
+	}
+}
+
+// TestArmSticky_RejectsArgvFlagSmuggling verifies a scene name beginning with
+// '-' silently skips sticky arming rather than fork-execing the watcher with
+// the value as argv. The `--` sentinel placed by armSticky already neutralises
+// pflag parsing of such tokens; this extra rejection is defense in depth so
+// any future regression in `--` handling doesn't open a flag-smuggling path.
+func TestArmSticky_RejectsArgvFlagSmuggling(t *testing.T) {
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "args")
+	stub := filepath.Join(dir, "sticky-stub.sh")
+	const stubScript = "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$ARGS_FILE\"\n"
+	if err := os.WriteFile(stub, []byte(stubScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARGS_FILE", argsFile)
+	t.Setenv("BULB_STICKY_S", "900")
+
+	prevBin := stickyBin
+	stickyBin = stub
+	t.Cleanup(func() { stickyBin = prevBin })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bulbs" && r.Method == "GET" {
+			_, _ = w.Write([]byte(`{"bulbs":[{"mac":"d8a0118dc5c3"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	m := multiplex.New(multiplex.DaemonURLs{"wiz": srv.URL})
+
+	// scene "-rf" looks like a flag — must NOT reach the watcher.
+	_ = callTool(t, m, "bulb_scene", map[string]any{"target": "d8a0118dc5c3", "scene": "-rf"})
+
+	time.Sleep(150 * time.Millisecond)
+	if b, err := os.ReadFile(argsFile); err == nil && len(b) > 0 {
+		t.Fatalf("sticky armed with flag-smuggling argv: %q", string(b))
 	}
 }
 
