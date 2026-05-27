@@ -3,7 +3,7 @@ module github.com/deepanshutr/bulb-mcp
 go 1.23
 
 require (
-	github.com/deepanshutr/bulb-cli v0.0.0-20260522082604-d231a48c59c8
+	github.com/deepanshutr/bulb-cli v0.0.0-20260527150825-8473d7f961fa
 	github.com/mark3labs/mcp-go v0.31.0
 )
 

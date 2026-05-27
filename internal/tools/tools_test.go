@@ -42,6 +42,10 @@ func TestRegister_NineAtomicTools(t *testing.T) {
 func TestTool_On_CallsMultiplexer(t *testing.T) {
 	var path string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/bulbs" && r.Method == "GET" {
+			_, _ = w.Write([]byte(`{"bulbs":[{"mac":"d8a0118dc5c3"}]}`))
+			return
+		}
 		path = r.URL.Path
 		_, _ = w.Write([]byte(`{}`))
 	}))
